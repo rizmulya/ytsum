@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# --------------------------------------------
+# Default Config
+# --------------------------------------------
+
+URL=""
+SUB_LANG="en"
+
+SUMMARIZE=false
+SUM_LANG="english"
+
+PROVIDER="deepseek"
+
+# --------------------------------------------
+# Helpers
+# --------------------------------------------
+
+usage() {
+    cat <<EOF
+Usage:
+  ytsum -u <youtube_url> [options]
+
+Options:
+  -u, --url         YouTube URL
+  -l, --lang        Subtitle language (default: en)
+
+  -s, --summarize   Summarize language
+                    Example:
+                      -s english
+                      -s indonesia
+
+  -p, --provider    AI provider:
+                      deepseek
+                      openai
+                    (default: deepseek)
+
+Examples:
+  ytsum -u URL
+  ytsum -u URL -l id
+  ytsum -u URL -s english
+  ytsum -u URL -s indonesia -p openai
+EOF
+}
+
+sanitize_filename() {
+    echo "$1" | \
+        sed 's/[\/:*?"<>|]/_/g' | \
+        tr -s ' ' '_' | \
+        tr -cd '[:alnum:]_.-'
+}
+
+get_video_title() {
+    yt-dlp --get-title "$1"
+}
+
+download_subtitle() {
+    local url="$1"
+    local lang="$2"
+    local safe_title="$3"
+
+    yt-dlp \
+        --write-auto-subs \
+        --sub-langs "$lang" \
+        --skip-download \
+        -o "${safe_title}.%(ext)s" \
+        "$url"
+}
+
+find_vtt_file() {
+    local safe_title="$1"
+
+    find . -maxdepth 1 -type f -name "${safe_title}*.vtt" | head -n 1
+}
+
+extract_transcript() {
+    local vtt_file="$1"
+    local output_file="$2"
+
+    sed -E '
+    s/<[^>]+>//g;
+    s/^[0-9:., -]+-->.*$//;
+    s/^WEBVTT.*$//;
+    s/^Kind:.*$//;
+    s/^Language:.*$//;
+    /^$/d
+    ' "$vtt_file" \
+    | awk '!seen[$0]++' \
+    | tr '\n' ' ' \
+    > "$output_file"
+}
+
+summarize_deepseek() {
+    local transcript="$1"
+    local sum_lang="$2"
+    local output_file="$3"
+
+    local content
+    content=$(cat "$transcript")
+
+    curl -s https://api.deepseek.com/chat/completions \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer ${DEEPSEEK_API_KEY}" \
+      -d "{
+        \"model\": \"deepseek-v4-flash\",
+        \"messages\": [
+          {
+            \"role\": \"system\",
+            \"content\": \"Summarize comprehensively in ${sum_lang}\"
+          },
+          {
+            \"role\": \"user\",
+            \"content\": $(jq -Rs . <<< "$content")
+          }
+        ],
+        \"thinking\": {\"type\": \"disabled\"},
+        \"stream\": false
+      }" \
+    | jq -r '.choices[0].message.content' \
+    > "$output_file"
+}
+
+summarize_openai() {
+    local transcript="$1"
+    local sum_lang="$2"
+    local output_file="$3"
+
+    local content
+    content=$(cat "$transcript")
+
+    curl -s https://api.openai.com/v1/chat/completions \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+      -d "{
+        \"model\": \"gpt-4.1-mini\",
+        \"messages\": [
+          {
+            \"role\": \"system\",
+            \"content\": \"Summarize comprehensively in ${sum_lang}\"
+          },
+          {
+            \"role\": \"user\",
+            \"content\": $(jq -Rs . <<< "$content")
+          }
+        ]
+      }" \
+    | jq -r '.choices[0].message.content' \
+    > "$output_file"
+}
+
+summarize_transcript() {
+    local provider="$1"
+    local transcript="$2"
+    local sum_lang="$3"
+    local output_file="$4"
+
+    case "$provider" in
+        deepseek)
+            summarize_deepseek \
+                "$transcript" \
+                "$sum_lang" \
+                "$output_file"
+            ;;
+        openai)
+            summarize_openai \
+                "$transcript" \
+                "$sum_lang" \
+                "$output_file"
+            ;;
+        *)
+            echo "Unsupported provider: $provider"
+            exit 1
+            ;;
+    esac
+}
+
+# --------------------------------------------
+# Argument Parser
+# --------------------------------------------
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -u|--url)
+            URL="$2"
+            shift 2
+            ;;
+
+        -l|--lang)
+            SUB_LANG="$2"
+            shift 2
+            ;;
+
+        -s|--summarize)
+            SUMMARIZE=true
+            SUM_LANG="$2"
+            shift 2
+            ;;
+
+        -p|--provider)
+            PROVIDER="$2"
+            shift 2
+            ;;
+
+        -h|--help)
+            usage
+            exit 0
+            ;;
+
+        *)
+            echo "Unknown argument: $1"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+# --------------------------------------------
+# Validation
+# --------------------------------------------
+
+if [[ -z "$URL" ]]; then
+    usage
+    exit 1
+fi
+
+# --------------------------------------------
+# Validate API Key
+# --------------------------------------------
+
+if [[ "$SUMMARIZE" == true ]]; then
+    case "$PROVIDER" in
+        deepseek)
+            if [[ -z "${DEEPSEEK_API_KEY:-}" ]]; then
+                echo "Error: DEEPSEEK_API_KEY environment variable is not set"
+                echo "Please set it using: export DEEPSEEK_API_KEY='your-api-key'"
+                exit 1
+            fi
+            ;;
+        openai)
+            if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+                echo "Error: OPENAI_API_KEY environment variable is not set"
+                echo "Please set it using: export OPENAI_API_KEY='your-api-key'"
+                exit 1
+            fi
+            ;;
+        *)
+            echo "Error: Unsupported provider: $PROVIDER"
+            exit 1
+            ;;
+    esac
+fi
+
+# --------------------------------------------
+# Main
+# --------------------------------------------
+
+TITLE=$(get_video_title "$URL")
+SAFE_TITLE=$(sanitize_filename "$TITLE")
+
+download_subtitle \
+    "$URL" \
+    "$SUB_LANG" \
+    "$SAFE_TITLE"
+
+VTT_FILE=$(find_vtt_file "$SAFE_TITLE")
+
+if [[ ! -f "$VTT_FILE" ]]; then
+    echo "Subtitle file not found"
+    exit 1
+fi
+
+TRANSCRIPT_FILE="${SAFE_TITLE}.txt"
+
+extract_transcript \
+    "$VTT_FILE" \
+    "$TRANSCRIPT_FILE"
+
+echo "$TRANSCRIPT_FILE"
+
+# --------------------------------------------
+# Summarize
+# --------------------------------------------
+
+if [[ "$SUMMARIZE" == true ]]; then
+
+    SUMMARY_FILE="Summary_${SAFE_TITLE}.md"
+
+    summarize_transcript \
+        "$PROVIDER" \
+        "$TRANSCRIPT_FILE" \
+        "$SUM_LANG" \
+        "$SUMMARY_FILE"
+
+    echo "$SUMMARY_FILE"
+fi
